@@ -268,6 +268,72 @@ func main() {
 ```    
 The above code in [go playground](https://play.golang.org/p/RuHQONqBXeg)
 
+### Incrementally collecting an OCF stream (Push / Finish)
+
+When an OCF file is appended to over time and its bytes arrive in arbitrary
+chunks — for instance tailing a file that a producer keeps writing — use
+`OCFCollector`. Each chunk handed to `Push` may split the stream at any byte
+boundary: inside the header, a block count or block size varint, a compressed
+block body, or a 16-byte sync marker. Incomplete frames are retained until
+more bytes arrive; a temporary lack of data is never mistaken for end of
+stream. `Finish` upgrades any still-incomplete frame into an
+`ErrOCFIncompleteFrame` error.
+
+A block is handed to the sink only after the entire frame passes every check
+and **every** record it contains is decoded through the standard `OCFReader`
+(including decompression). A block whose later records fail decoding therefore
+never reaches the sink, so a bad later record cannot leak the block's earlier
+records. The sink must be idempotent: each block carries a stable
+`OCFBlockKey` made of the caller's `SourceEpoch` and the block's absolute
+start offset, and the same key is redelivered, unchanged, whenever a previous
+attempt failed.
+
+The bookmark advances only after the sink acknowledges a block. Persist it and
+reopen with it later to resume by pushing only the bytes past the confirmed
+boundary; earlier bytes are never rescanned.
+
+```go
+sink := goavro.OCFBlockSinkFunc(func(key goavro.OCFBlockKey, records []interface{}) error {
+    // Upsert `records` using the stable key so retries never duplicate data.
+    // The collector does not retain this slice after the call returns.
+    return durableUpsert(key, records)
+})
+
+collector, err := goavro.NewOCFCollector(goavro.OCFCollectorConfig{
+    Sink:        sink,
+    SourceEpoch: "file:/var/log/events.avro", // opaque; part of the stable key
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+// Feed arbitrary chunks as they arrive. Push copies the bytes, so the caller
+// keeps ownership of its buffer.
+for chunk := range incomingChunks {
+    if err := collector.Push(chunk); err != nil {
+        // A sink error is retryable; framing/decoding errors are permanent.
+        log.Fatal(err)
+    }
+}
+if err := collector.Finish(); err != nil {
+    log.Fatal(err) // ErrOCFIncompleteFrame if the stream ends mid-frame
+}
+
+// Persist this to resume without rescanning acknowledged bytes.
+bookmark := collector.Bookmark()
+
+// ...later, resume from the bookmark (push only bytes >= bookmark.NextOffset):
+resumed, err := goavro.NewOCFCollector(goavro.OCFCollectorConfig{
+    Sink:     sink,
+    Bookmark: &bookmark,
+})
+```
+
+`MaxPendingFrames` (default 1024) bounds how many validated blocks may be
+queued behind a failing sink; once reached, `Push` returns
+`ErrOCFPendingFrameLimit` without retaining the new bytes, applying
+back-pressure until the sink catches up.
+
 ### ab2t
 
 The `ab2t` program is similar to the reference standard
